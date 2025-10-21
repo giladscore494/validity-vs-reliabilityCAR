@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 # ===========================================================
-# 🚗 AI Deal Benchmark (25 Slots, 2 Rounds, 4 Planned Stops)
-# Gemini 2.5 Pro (Tool prompt) vs GPT-4o (Knowledgeable buyer)
-# Auto-Save (always-on download) + Resume + Hard Pauses @12/@25 each round
+# 🚗 AI Deal Benchmark — 25 Slots × 2 Rounds
+# Gemini 2.5 Pro (Tool prompt, web reasoning) vs GPT-4o (knowledgeable buyer)
+# Per-slot "Analyze" buttons • Auto-Save (always-on download) • Resume • Planned stops @12/@25 each round
 # ===========================================================
 
 import os, json, time, re
@@ -14,31 +14,35 @@ import streamlit as st
 from PIL import Image
 from json_repair import repair_json
 
+# APIs
 import google.generativeai as genai
 from openai import OpenAI
 
 # ------------------------- CONFIG ---------------------------
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.2.0"
 st.set_page_config(page_title="AI Deal Benchmark 25", page_icon="🚗", layout="wide")
 st.title("🚗 AI Deal Benchmark — 25 Listings × 2 Rounds")
-st.caption(f"Gemini 2.5 Pro (Tool) vs GPT-4o (Knowledgeable buyer) • Auto-Save, Resume & Hard Pauses • v{APP_VERSION}")
+st.caption(f"Gemini 2.5 Pro (Tool) vs GPT-4o (Buyer) • Per-slot Analyze • Auto-Save/Resume • Planned Stops • v{APP_VERSION}")
 
+# Secrets
 GEMINI_KEY  = st.secrets.get("GEMINI_API_KEY", "")
 OPENAI_KEY  = st.secrets.get("OPENAI_API_KEY", "")
 if not GEMINI_KEY or not OPENAI_KEY:
     st.error("Missing GEMINI_API_KEY or OPENAI_API_KEY in Streamlit secrets.")
     st.stop()
 
+# Init clients
 genai.configure(api_key=GEMINI_KEY)
 gem_model = genai.GenerativeModel("gemini-2.5-pro")
 gpt_client = OpenAI(api_key=OPENAI_KEY)
 
-AUTOSAVE_CSV     = "autosave.csv"          # חי תמידי
-BACKUP_PATTERN   = "autosave_backup-{ts}.csv"
-FINAL_ROUND_CSV  = "results_round{r}.csv"   # בסיום כל סבב
+# Files
+AUTOSAVE_CSV     = "autosave.csv"
+FINAL_ROUND_CSV  = "results_round{r}.csv"
 FINAL_COMBINED   = "results_combined.csv"
 
-PLANNED_STOPS = {1: {12, 25}, 2: {12, 25}}  # בהתאם לדרישה: 4 עצירות
+# Planned stops
+PLANNED_STOPS = {1: {12, 25}, 2: {12, 25}}
 
 # ----------------------- HELPERS ----------------------------
 def parse_json_safe(raw: str):
@@ -57,7 +61,7 @@ def img_to_jpeg_bytes(file):
     try:
         img = Image.open(file).convert("RGB")
         buf = BytesIO()
-        img.save(buf, format="JPEG", quality=92)
+        img.save(buf, format="JPEG", quality=90)
         return buf.getvalue()
     except Exception:
         return None
@@ -74,47 +78,37 @@ def ensure_df_schema(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = []
     return df[cols]
 
-def save_autosave(df: pd.DataFrame):
-    df = ensure_df_schema(df)
-    df.to_csv(AUTOSAVE_CSV, index=False, encoding="utf-8")
-
-def save_backup(df: pd.DataFrame):
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    df.to_csv(BACKUP_PATTERN.format(ts=ts), index=False, encoding="utf-8")
-
 def load_autosave() -> pd.DataFrame:
     if os.path.exists(AUTOSAVE_CSV):
         try:
             df = pd.read_csv(AUTOSAVE_CSV)
             return ensure_df_schema(df)
         except Exception:
-            return pd.DataFrame(columns=[
-                "round","slot","ad_text",
-                "gemini_json","gpt_text",
-                "eval_winner","eval_gemini_acc","eval_gpt_acc","eval_summary",
-                "timestamp"
-            ])
-    return pd.DataFrame(columns=[
-        "round","slot","ad_text",
-        "gemini_json","gpt_text",
-        "eval_winner","eval_gemini_acc","eval_gpt_acc","eval_summary",
-        "timestamp"
-    ])
+            pass
+    return ensure_df_schema(pd.DataFrame())
 
-def download_df(df: pd.DataFrame, label="📥 Download Latest Auto-Save"):
+def save_autosave(df: pd.DataFrame):
+    df = ensure_df_schema(df)
+    df.to_csv(AUTOSAVE_CSV, index=False, encoding="utf-8")
+
+def download_df(df: pd.DataFrame, label="📥 Download Latest Auto-Save", key_suffix=None):
     df = ensure_df_schema(df)
     if not df.empty:
-        st.download_button(label, df.to_csv(index=False).encode("utf-8"),
-                           file_name="autosave.csv", mime="text/csv", use_container_width=True)
+        csv_data = df.to_csv(index=False).encode("utf-8")
+        unique_key = f"download_{key_suffix or int(time.time()*1000)}"
+        st.download_button(
+            label,
+            csv_data,
+            file_name="autosave.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=unique_key
+        )
 
 def resume_progress(df: pd.DataFrame):
-    """
-    Returns (round_idx, next_slot)
-    round_idx ∈ {1,2}; next_slot ∈ [1..25]
-    """
+    """Detect next round+slot to continue from."""
     if df is None or df.empty:
         return 1, 1
-    # find last (round,slot)
     last = df.sort_values(["round","slot"]).tail(1)
     last_round = int(last["round"].values[0])
     last_slot  = int(last["slot"].values[0])
@@ -123,7 +117,15 @@ def resume_progress(df: pd.DataFrame):
     else:
         return min(2, last_round + 1), 1
 
-# ----------------------- PROMPTS ----------------------------
+def build_extra(vin, zip_code, seller, photo_count):
+    parts = []
+    if vin: parts.append(f"VIN: {vin}")
+    if zip_code: parts.append(f"ZIP/State: {zip_code}")
+    if seller: parts.append(f"Seller: {seller}")
+    if photo_count: parts.append(f"Photos provided: {photo_count}")
+    return "\n".join(parts)
+
+# ----------------------- PROMPTS (YOUR EXACT TEXT) ----------------------------
 # 1) FULL TOOL PROMPT (Gemini) — EXACTLY YOUR PROMPT, as provided
 def build_gemini_tool_prompt(ad: str, extra: str, must_id: str, exact_json: dict, similar_json: list) -> str:
     exact_s = json.dumps(exact_json or {}, ensure_ascii=False)
@@ -340,7 +342,6 @@ def call_evaluator(ad_text: str, gem_out: str, gpt_out: str):
 # ------------------------- UI -------------------------------
 st.sidebar.header("Run Control")
 
-# Resume / New
 mode = st.sidebar.radio("Mode", ["New run", "Resume from file"], horizontal=True)
 autosave_df = load_autosave()
 
@@ -354,150 +355,136 @@ if mode == "Resume from file":
         except Exception as e:
             st.sidebar.error(f"Failed to read CSV: {e}")
 
-# Status + live download button
+# Sidebar live download button — always available
 st.sidebar.markdown("**Auto-Save (always latest):**")
-download_df(autosave_df)
+download_df(autosave_df, key_suffix="sidebar")
 
-# Round selection (we compute next automatically, but allow override)
 auto_round, auto_slot = resume_progress(autosave_df)
 round_choice = st.sidebar.selectbox("Round", [1,2], index=(auto_round-1))
 st.sidebar.caption(f"Auto-detected next slot: round {auto_round}, slot {auto_slot}")
 
-# Inputs grid (25 slots)
-st.subheader("Enter up to 25 real listings (text + optional image)")
+# Global metadata (optional)
+st.markdown("### Global details (optional, applied to all slots on analyze)")
+g1, g2, g3 = st.columns(3)
+with g1:
+    vin_global  = st.text_input("VIN", "")
+with g2:
+    zip_global  = st.text_input("ZIP / State", "")
+with g3:
+    seller_type = st.selectbox("Seller", ["","private","dealer"])
+
+# Inputs grid — 25 slots
+st.markdown("### Enter up to 25 real listings (text + optional image)")
 slot_inputs = []
 grid_cols = st.columns(5)
 for i in range(25):
     col = grid_cols[i % 5]
-    with col.expander(f"Slot #{i+1}"):
-        txt = st.text_area(f"Listing text #{i+1}", key=f"txt_{i+1}", height=140, placeholder="Year • Make • Model • Trim • Mileage • Price • Title • Location • Options ...")
+    with col.expander(f"Slot #{i+1}", expanded=(i<5)):
+        txt = st.text_area(f"Listing text #{i+1}", key=f"txt_{i+1}", height=160, placeholder="Year • Make • Model • Trim • Mileage • Price • Title • Location • Options …")
         img = st.file_uploader(f"Image #{i+1}", type=["jpg","jpeg","png"], key=f"img_{i+1}")
+        # Per-slot analyze button
         slot_inputs.append((txt, img))
 
-# Extra fields (VIN/ZIP/seller optional per-run; user יכול להדביק בטקסט עצמו אם מעדיף)
-vin_global  = st.text_input("VIN (optional, global hint)", "")
-zip_global  = st.text_input("ZIP / State (optional, global hint, e.g., 44105 or OH)", "")
-seller_type = st.selectbox("Seller (optional, global hint)", ["","private","dealer"])
+# Always-on download button under grid
+download_df(autosave_df, label="📥 Download Auto-Save (below grid)", key_suffix="below_grid")
 
-def build_extra(vin, zip_code, seller, photo_count):
-    parts = []
-    if vin: parts.append(f"VIN: {vin}")
-    if zip_code: parts.append(f"ZIP/State: {zip_code}")
-    if seller: parts.append(f"Seller: {seller}")
-    if photo_count: parts.append(f"Photos provided: {photo_count}")
-    return "\n".join(parts)
-
-# --------------------- RUN BENCHMARK ------------------------
-if st.button("🚀 Run Benchmark (Gemini vs GPT)"):
-    st.write("### Benchmark started")
-    results = ensure_df_schema(autosave_df.copy())
-    # compute start indices
-    r_current = round_choice
-    # if continuing existing round, continue slots; else if new round selected, reset slot to 1
-    if not results.empty and (results["round"] == r_current).any():
-        done_slots = set(results.loc[results["round"] == r_current, "slot"].astype(int).tolist())
-    else:
-        done_slots = set()
-
-    progress = st.progress(0.0)
-    total_slots = 25
-    processed = 0
-
-    for idx in range(1, total_slots+1):
-        # if already processed in this round, skip
-        if idx in done_slots:
-            processed += 1
-            progress.progress(processed/total_slots)
-            continue
-
-        ad_text, img_file = slot_inputs[idx-1]
-        if not (ad_text or "").strip():
-            # empty slot, just skip but count toward progress bar
-            processed += 1
-            progress.progress(processed/total_slots)
-            continue
-
-        st.write(f"**▶ Round {r_current}, Slot {idx}**")
-        img_bytes = img_to_jpeg_bytes(img_file)
-
-        # Build minimal memory anchors (empty by default; you can wire actual memory if needed)
-        exact_prev  = {}
-        similar_prev = []
-
-        # MUST ID
-        must_id = f"R{r_current}-S{idx}-{int(time.time())}"
-        extra = build_extra(vin_global, zip_global, seller_type, 1 if img_bytes else 0)
-
-        # 1) Gemini Tool (full JSON expected)
-        with st.spinner("Gemini 2.5 Pro (Tool) analyzing with web reasoning…"):
-            gem_raw = call_gemini_tool(ad_text, extra, must_id, exact_prev, similar_prev, img_bytes)
-        # keep raw (truncate for storage safety)
-        gem_raw_trunc = gem_raw[:18000]
-
-        # 2) GPT-4o (knowledgeable buyer)
-        with st.spinner("GPT-4o (knowledgeable buyer) evaluating…"):
-            gpt_text = call_gpt_buyer(ad_text)
-        gpt_text_trunc = gpt_text[:18000]
-
-        # 3) Evaluator (Gemini) — accuracy scoring + summary
-        with st.spinner("Evaluator (Gemini) fact-checking both outputs…"):
-            ev = call_evaluator(ad_text, gem_raw_trunc, gpt_text_trunc)
-        ev_gem = int(ev.get("gemini_accuracy_score", 0) or 0)
-        ev_gpt = int(ev.get("gpt_accuracy_score", 0) or 0)
-        ev_w   = str(ev.get("winner","")).strip() or ("Gemini" if ev_gem>ev_gpt else ("GPT" if ev_gpt>ev_gem else "Tie"))
-        ev_s   = str(ev.get("evaluation_summary","")).strip()
-
-        # Append row
-        new_row = {
-            "round": r_current,
-            "slot": idx,
-            "ad_text": ad_text[:2000],
-            "gemini_json": gem_raw_trunc,
-            "gpt_text": gpt_text_trunc,
-            "eval_winner": ev_w,
-            "eval_gemini_acc": ev_gem,
-            "eval_gpt_acc": ev_gpt,
-            "eval_summary": ev_s,
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
-        }
-        results = pd.concat([results, pd.DataFrame([new_row])], ignore_index=True)
-
-        # Auto-save after every slot + always-on download
-        save_autosave(results)
-        st.success(f"Saved Round {r_current} Slot {idx} to autosave.csv")
-        download_df(results)
-
-        # Backup every 5 slots
-        if idx % 5 == 0:
-            save_backup(results)
-
-        processed += 1
-        progress.progress(processed/total_slots)
-
-        # Planned stop?
-        if idx in PLANNED_STOPS.get(r_current, set()):
-            # Save a round CSV snapshot as well
-            round_csv = FINAL_ROUND_CSV.format(r=r_current)
-            ensure_df_schema(results[results["round"] == r_current]).to_csv(round_csv, index=False, encoding="utf-8")
-            st.warning(f"⏸ Planned stop after Round {r_current} Slot {idx}. "
-                       f"Auto-save written. Download now and resume by re-uploading autosave.csv.")
-            download_df(results)
-            st.stop()
-
-    # End of round → write round file
-    round_csv = FINAL_ROUND_CSV.format(r=r_current)
-    ensure_df_schema(results[results["round"] == r_current]).to_csv(round_csv, index=False, encoding="utf-8")
-    st.success(f"✅ Round {r_current} completed. Saved {round_csv}.")
-    download_df(results)
-
-    # If both rounds exist → write combined
-    have_r1 = (results["round"] == 1).any()
-    have_r2 = (results["round"] == 2).any()
-    if have_r1 and have_r2:
-        ensure_df_schema(results).to_csv(FINAL_COMBINED, index=False, encoding="utf-8")
-        st.info("📦 Combined results saved as results_combined.csv")
-        download_df(results)
-
-# ------------------------ FOOTER ----------------------------
+# --------------------- PER-SLOT ANALYZE ---------------------
 st.markdown("---")
-st.caption("AI Deal Benchmark 25 © 2025 — Gemini 2.5 Pro (Tool+Evaluator) vs GPT-4o • Auto-Save/Resume • Planned Stops @12/@25 each round")
+st.subheader("Per-slot Analyze (Gemini vs GPT)")
+
+results = autosave_df.copy()
+
+# Show 25 buttons in a 5×5 grid: “Analyze Slot #i”
+btn_cols = st.columns(5)
+for i in range(25):
+    col = btn_cols[i % 5]
+    with col:
+        if st.button(f"Analyze #{i+1}", key=f"analyze_{round_choice}_{i+1}"):
+            ad_text, img_file = slot_inputs[i]
+            slot_id = i + 1
+
+            if not (ad_text and ad_text.strip()):
+                st.warning(f"Slot {slot_id}: Please paste listing text first.")
+                st.stop()
+
+            # Check if this slot already processed in this round
+            already = False
+            if not results.empty:
+                already = ((results["round"]==round_choice) & (results["slot"]==slot_id)).any()
+            if already:
+                st.info(f"Round {round_choice} Slot {slot_id} already exists in autosave. Replacing with new analysis…")
+                results = results[~((results["round"]==round_choice) & (results["slot"]==slot_id))].copy()
+
+            img_bytes = img_to_jpeg_bytes(img_file)
+            must_id = f"R{round_choice}-S{slot_id}-{int(time.time())}"
+            extra = build_extra(vin_global, zip_global, seller_type, 1 if img_bytes else 0)
+
+            # (Basic memory anchors could be added here if desired; keeping simple for per-slot on-demand run)
+            exact_prev, sims = {}, []
+
+            with st.spinner(f"Gemini 2.5 Pro analyzing slot {slot_id}…"):
+                gem_raw = call_gemini_tool(ad_text, extra, must_id, exact_prev, sims, img_bytes)
+            gem_raw_trunc = (gem_raw or "")[:18000]
+
+            with st.spinner(f"GPT-4o analyzing slot {slot_id}…"):
+                gpt_text = call_gpt_buyer(ad_text)
+            gpt_text_trunc = (gpt_text or "")[:18000]
+
+            with st.spinner("Evaluator verifying…"):
+                ev = call_evaluator(ad_text, gem_raw_trunc, gpt_text_trunc)
+            ev_gem = int(ev.get("gemini_accuracy_score", 0))
+            ev_gpt = int(ev.get("gpt_accuracy_score", 0))
+            ev_w   = str(ev.get("winner","")).strip() or ("Gemini" if ev_gem>ev_gpt else ("GPT" if ev_gpt>ev_gem else "Tie"))
+            ev_s   = str(ev.get("evaluation_summary","")).strip()
+
+            new_row = {
+                "round": round_choice,
+                "slot": slot_id,
+                "ad_text": ad_text[:2000],
+                "gemini_json": gem_raw_trunc,
+                "gpt_text": gpt_text_trunc,
+                "eval_winner": ev_w,
+                "eval_gemini_acc": ev_gem,
+                "eval_gpt_acc": ev_gpt,
+                "eval_summary": ev_s,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            }
+            results = pd.concat([ensure_df_schema(results), pd.DataFrame([new_row])], ignore_index=True)
+
+            # Persist autosave immediately
+            save_autosave(results)
+            st.success(f"Saved Round {round_choice} Slot {slot_id} ✅")
+            download_df(results, key_suffix=f"slot_{round_choice}_{slot_id}")
+
+            # Planned stop logic
+            if slot_id in PLANNED_STOPS.get(round_choice, set()):
+                # Save round file and stop
+                ensure_df_schema(results[results["round"] == round_choice]).to_csv(FINAL_ROUND_CSV.format(r=round_choice), index=False)
+                st.warning(f"⏸ Planned stop after Round {round_choice} Slot {slot_id}. Download autosave.csv and resume later.")
+                download_df(results, key_suffix=f"pause_{round_choice}_{slot_id}")
+                st.stop()
+
+# --------------------- SUMMARY & EXPORTS ---------------------
+st.markdown("---")
+st.subheader("Run Status")
+
+# Show table preview for current round
+round_df = ensure_df_schema(results[results["round"] == round_choice].copy())
+st.dataframe(round_df.sort_values("slot"), use_container_width=True)
+
+# Save round CSV and combined CSV buttons
+c1, c2, c3 = st.columns(3)
+with c1:
+    if st.button(f"💾 Save Round {round_choice} CSV", key=f"save_round_{round_choice}"):
+        ensure_df_schema(round_df).to_csv(FINAL_ROUND_CSV.format(r=round_choice), index=False)
+        st.success(f"Saved {FINAL_ROUND_CSV.format(r=round_choice)}")
+with c2:
+    # Combine all rounds (if both exist)
+    if st.button("🧩 Save Combined CSV (all)", key="save_combined"):
+        ensure_df_schema(results).to_csv(FINAL_COMBINED, index=False)
+        st.success(f"Saved {FINAL_COMBINED}")
+with c3:
+    download_df(results, label="📥 Download Auto-Save (footer)", key_suffix="footer")
+
+st.caption("Tip: In case of unexpected crash, the latest autosave.csv is already on disk. Use 'Resume from file' to continue exactly where you left off.")
+st.caption("AI Deal Benchmark 25 © 2025 — Gemini 2.5 Pro vs GPT-4o • Auto-Save/Resume • Per-slot Analyze • Planned Stops")
